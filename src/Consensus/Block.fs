@@ -1,3 +1,5 @@
+// Modification to src/Consensus/Block.fs
+
 module Consensus.Block
 
 open Consensus
@@ -27,6 +29,16 @@ let genesisParent =
         difficulty  = 0ul
         nonce       = (0UL, 0UL)
     }
+
+// CGP2 wallet address: zen1qqcarpd4cqrzy4rx7se9fwtmlq8puruc98yz5ctd46f0xcsxwqenqfl8phh
+// We need to extract the PK hash from this address
+let cgp2PkHash =
+    FsBech32.Zen.decode "zen1qqcarpd4cqrzy4rx7se9fwtmlq8puruc98yz5ctd46f0xcsxwqenqfl8phh"
+    |> Option.map (fun (_, data) -> Hash.Hash data)
+    |> Option.defaultValue Hash.zero // Fallback to zero hash if address is invalid
+
+// Define the amount to airdrop to CGP2 in each block (10% of block reward)
+let cgp2AirdropPercentage = 10UL
 
 let computeCommitmentsRoot : Hash.Hash list -> Hash.Hash =
     MerkleTree.computeRoot
@@ -143,6 +155,28 @@ let getCgpCoinbase
         else
             []
 
+// New function to create CGP2 airdrop output
+let getCgp2Airdrop
+    ( chainParams : ChainParameters )
+    ( blockNumber : uint32          )
+    ( cgp         : CGP.T           )
+    : Output list =
+    
+    // Calculate 10% of the block reward for CGP2
+    let blockRewardAmount = blockReward blockNumber cgp.allocation
+    let cgp2Amount = (blockRewardAmount * cgp2AirdropPercentage) / 100UL
+    
+    if cgp2Amount > 0UL then
+        [{
+            lock = PK cgp2PkHash  // Use the wallet's PK hash
+            spend = {
+                asset = Asset.Zen
+                amount = cgp2Amount
+            }
+        }]
+    else
+        []
+
 let getBlockCoinbase
     ( chainParams    : ChainParameters          )
     ( acs            : ActiveContractSet.T      )
@@ -161,9 +195,12 @@ let getBlockCoinbase
     let blockRewardAndFees =
         let totalZen       = Fund.find Asset.Zen blockFees
         let blockSacrifice = getBlockSacrificeAmount chainParams acs
-        let blockReward    = blockReward blockNumber cgp.allocation
+        
+        // Calculate base miner reward (reduced by CGP2 airdrop percentage)
+        let baseReward = blockReward blockNumber cgp.allocation
+        let minerReward = baseReward * (100UL - cgp2AirdropPercentage) / 100UL
 
-        Map.add Asset.Zen (totalZen + blockReward + blockSacrifice) blockFees
+        Map.add Asset.Zen (totalZen + minerReward + blockSacrifice) blockFees
     
     // Get the coinbase outputs by summing the fees per asset and adding the block reward
     let coinbaseOutputs =
@@ -177,10 +214,13 @@ let getBlockCoinbase
             end
         |> Seq.toList
     
+    // Add CGP and CGP2 outputs
+    let outputs = coinbaseOutputs @ getCgpCoinbase chainParams blockNumber cgp @ getCgp2Airdrop chainParams blockNumber cgp
+    
     let tx = {
         version   = Version0
         inputs    = []
-        outputs   = coinbaseOutputs @ getCgpCoinbase chainParams blockNumber cgp
+        outputs   = outputs
         contract  = None
         witnesses = []
     }
