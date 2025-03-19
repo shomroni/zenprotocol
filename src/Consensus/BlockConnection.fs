@@ -1,3 +1,5 @@
+// Modification to src/Consensus/BlockConnection.fs
+
 module Consensus.BlockConnection
 
 open Consensus
@@ -118,6 +120,15 @@ module TxInputs =
 
 module Coinbase =
     
+    // CGP2 airdrop percentage - must match the value in Block.fs
+    let cgp2AirdropPercentage = 10UL
+
+    // CGP2 wallet address (must match Block.fs)
+    let cgp2PkHash =
+        FsBech32.Zen.decode "zen1qqcarpd4cqrzy4rx7se9fwtmlq8puruc98yz5ctd46f0xcsxwqenqfl8phh"
+        |> Option.map (fun (_, data) -> Hash.Hash data)
+        |> Option.defaultValue Hash.zero
+    
     let private computeblockRewardAndFees
         ( outputs : Output list )
         ( state   : State       )
@@ -135,13 +146,19 @@ module Coinbase =
         let blockSacrifice =
             getBlockSacrificeAmount env.chainParams state.acs
         
-        let blockReward =
+        // Total original block reward
+        let originalBlockReward =
             blockReward env.block.header.blockNumber state.cgp.allocation
+        
+        // Miner reward (90% of original block reward)
+        let minerReward =
+            originalBlockReward * (100UL - cgp2AirdropPercentage) / 100UL
         
         let allocationReward =
             blockAllocation env.block.header.blockNumber state.cgp.allocation
         
-        Map.add Asset.Zen (totalZen + blockSacrifice + blockReward + allocationReward) blockFees
+        // Add the fees, sacrifices, and reduced miner reward
+        Map.add Asset.Zen (totalZen + blockSacrifice + minerReward + allocationReward) blockFees
     
     let private splitOutputs
         ( block : Block)
@@ -161,6 +178,16 @@ module Coinbase =
         else
             let! coinbaseOutputs, otherOutputs = splitOutputs env.block
             
+            // Extract CGP2 outputs
+            let cgp2Outputs =
+                coinbaseOutputs |> Fund.accumulateSpends
+                    begin function
+                    | {lock = PK pkHash; spend=spend} when pkHash = cgp2PkHash ->
+                        Some spend
+                    | _ ->
+                        None
+                    end
+            
             // Compute the amount of reward per asset
             let coinbaseTotals =
                 coinbaseOutputs |> Fund.accumulateSpends
@@ -170,28 +197,45 @@ module Coinbase =
             let blockRewardAndFees =
                 computeblockRewardAndFees otherOutputs state env
             
+            // Extract CGP contract outputs
             let cgpAmounts =
                 coinbaseOutputs |> Fund.accumulateSpends
                     begin function
-                    | {lock = Contract contractId; spend=spend} when contractId=env.chainParams.cgpContractId ->
+                    | {lock = Contract contractId; spend=spend} when contractId = env.chainParams.cgpContractId ->
                         Some spend
                     | _ ->
                         None
                     end
             
+            // Get all contract outputs - should only be CGP contract
             let allContractAmounts =
                 coinbaseOutputs |> Fund.accumulateSpends
                     (function | {lock = Contract _; spend=spend} -> Some spend | _ -> None)
             
+            // CGP Zen amount
             let cgpZenAmount =
                 Fund.find Asset.Zen cgpAmounts
             
+            // CGP2 Zen amount (should be 10% of the block reward)
+            let cgp2ZenAmount =
+                Fund.find Asset.Zen cgp2Outputs
+            
+            // Calculate expected CGP2 amount (10% of original block reward)
+            let originalBlockReward = blockReward env.block.header.blockNumber state.cgp.allocation
+            let expectedCgp2Amount = (originalBlockReward * cgp2AirdropPercentage) / 100UL
+            
+            // Verify that the coinbase total (miner + CGP + CGP2) matches the expected amount
             if coinbaseTotals <> blockRewardAndFees then
                 return! Error "block reward is incorrect"
+            // Verify that all contract outputs are going to the CGP contract
             elif allContractAmounts <> cgpAmounts then
                 return! Error "reward to cgp contract in invalid"
+            // Verify that the CGP amount is correct
             elif cgpZenAmount <> (blockAllocation env.block.header.blockNumber state.cgp.allocation) then
-                return! Error "reward is not divided correctly"
+                return! Error "cgp reward is not correct"
+            // Verify that the CGP2 amount is correct (10% of original block reward)
+            elif cgp2ZenAmount <> expectedCgp2Amount && expectedCgp2Amount > 0UL then
+                return! Error "cgp2 reward is not correct"
             else
                 return state
         }
